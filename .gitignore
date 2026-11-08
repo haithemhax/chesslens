@@ -1,0 +1,6 @@
+node_modules/
+dist/
+backups/
+vision-service/.venv/
+vision-service/wheels/
+vision-service/logs/

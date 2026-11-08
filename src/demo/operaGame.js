@@ -1,0 +1,15 @@
+// The Opera Game (Morphy vs. Duke of Brunswick & Count Isouard, Paris 1858).
+// Demo mode replays this game through the exact same pipeline as the camera:
+// move -> engine evaluation -> verdict -> commentary.
+export const OPERA_GAME = {
+  title: 'The Opera Game',
+  subtitle: 'Morphy vs. Duke of Brunswick & Count Isouard · Paris 1858',
+  moves: [
+    'e4', 'e5', 'Nf3', 'd6', 'd4', 'Bg4', 'dxe5', 'Bxf3', 'Qxf3', 'dxe5',
+    'Bc4', 'Nf6', 'Qb3', 'Qe7', 'Nc3', 'c6', 'Bg5', 'b5', 'Nxb5', 'cxb5',
+    'Bxb5+', 'Nbd7', 'O-O-O', 'Rd8', 'Rxd7', 'Rxd7', 'Rd1', 'Qe6', 'Bxd7+', 'Nxd7',
+    'Qb8+', 'Nxb8', 'Rd8#',
+  ],
+};
+
+export const DEMO_MOVE_INTERVAL_MS = 3600;
