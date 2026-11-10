@@ -244,6 +244,15 @@ export const useChessLens = create((set, get) => ({
     devices: [],
     deviceId: savedSettings.deviceId,
   },
+  cameraFit: {
+    status: 'good',
+    score: 100,
+    messages: [],
+    hints: [],
+    geom: null,
+    img: null,
+    lastCheckedAt: 0,
+  },
   vision: {
     mode: 'idle',
     motion: 0,
@@ -625,6 +634,12 @@ export const useChessLens = create((set, get) => ({
 
   setCamera(patch) {
     set((state) => ({ camera: { ...state.camera, ...patch } }));
+  },
+
+  setCameraFit(cameraFit) {
+    set((state) => ({
+      cameraFit: typeof cameraFit === 'function' ? cameraFit(state.cameraFit) : cameraFit,
+    }));
   },
 
   setVision(patch) {

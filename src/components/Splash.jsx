@@ -33,6 +33,7 @@ export default function Splash() {
   const lang = useChessLens((state) => state.settings.lang);
   const engine = useChessLens((state) => state.engine);
   const camera = useChessLens((state) => state.camera);
+  const cameraFit = useChessLens((state) => state.cameraFit);
   const calibration = useChessLens((state) => state.calibration);
   const setUi = useChessLens((state) => state.setUi);
   const { startShow, toggleDemo, toggleOperator } = useShow();
@@ -80,9 +81,12 @@ export default function Splash() {
     toggleOperator();
   }
 
+  const cameraFitOk = !cameraLive || (cameraFit?.status !== 'poor');
+
   const checklistItems = [
     { label: t('checkCamera'), ok: cameraLive },
     { label: t('checkCalibration'), ok: calibrationReady },
+    { label: t('checkCameraFit'), ok: cameraFitOk },
     { label: t('checkEngine'), ok: engineReady },
     { label: t('checkFonts'), ok: fontsLoaded },
     { label: t('checkFullscreen'), ok: fullscreenReady },

@@ -3,8 +3,11 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { useShow } from '../state/ShowProvider.jsx';
 import { useChessLens } from '../state/store.js';
 import { translate } from '../i18n/translations.js';
-import { buildWarpMap } from '../lib/homography.js';
+import { buildWarpMap, squareToCell } from '../lib/homography.js';
 import { clearCalibration } from '../lib/storage.js';
+import { drawCameraFitOverlay } from '../lib/cameraFit.js';
+import { refineCorners } from '../vision/v2/cornerRefinement.js';
+import CameraFitPanel from './CameraFitPanel.jsx';
 import { cx } from './Ui.jsx';
 
 const WARP_SIZE = 240;
@@ -13,16 +16,27 @@ function clamp01(value) {
   return Math.min(1, Math.max(0, value));
 }
 
-function drawOverlay(ctx, width, height, corners, draggingIndex = -1, offscreenCanvas = null) {
+function drawOverlay(
+  ctx,
+  width,
+  height,
+  corners,
+  draggingIndex = -1,
+  offscreenCanvas = null,
+  refinement = null,
+  previewRefined = true,
+) {
   if (!corners.length) return;
   const radius = Math.max(9, width * 0.012);
 
   ctx.save();
   ctx.lineWidth = Math.max(2, width * 0.003);
-  ctx.strokeStyle = 'rgba(240,217,168,0.95)';
-  ctx.fillStyle = 'rgba(240,217,168,0.12)';
 
-  if (corners.length > 1) {
+  // If refinement candidate is active, show visual comparison
+  if (refinement && refinement.refinedCorners) {
+    // 1. Draw original corners with dashed line
+    ctx.strokeStyle = 'rgba(230, 192, 121, 0.45)';
+    ctx.setLineDash([4, 4]);
     ctx.beginPath();
     corners.forEach((point, index) => {
       const x = point.x * width;
@@ -30,32 +44,89 @@ function drawOverlay(ctx, width, height, corners, draggingIndex = -1, offscreenC
       if (index === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     });
-    if (corners.length === 4) {
-      ctx.closePath();
-      ctx.fill();
-    }
+    ctx.closePath();
     ctx.stroke();
-  }
+    ctx.setLineDash([]);
 
-  corners.forEach((point, index) => {
-    const x = point.x * width;
-    const y = point.y * height;
-    const isDragged = index === draggingIndex;
+    // 2. Draw connecting vector lines
+    ctx.strokeStyle = 'rgba(52, 211, 153, 0.8)';
+    ctx.lineWidth = 1.5;
+    corners.forEach((pt, i) => {
+      const ref = refinement.refinedCorners[i];
+      if (!ref) return;
+      ctx.beginPath();
+      ctx.moveTo(pt.x * width, pt.y * height);
+      ctx.lineTo(ref.x * width, ref.y * height);
+      ctx.stroke();
+    });
 
+    // 3. Draw refined corners in emerald
+    ctx.strokeStyle = '#10b981';
+    ctx.fillStyle = 'rgba(16, 185, 129, 0.15)';
+    ctx.lineWidth = Math.max(2, width * 0.003);
     ctx.beginPath();
-    ctx.arc(x, y, isDragged ? radius * 1.3 : radius, 0, Math.PI * 2);
-    ctx.fillStyle = isDragged ? '#f6e6c4' : '#e6c079';
-    ctx.fill();
-    ctx.lineWidth = Math.max(2, width * 0.0025);
-    ctx.strokeStyle = 'rgba(8,9,12,0.85)';
+    refinement.refinedCorners.forEach((point, index) => {
+      const x = point.x * width;
+      const y = point.y * height;
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.closePath();
     ctx.stroke();
+    ctx.fill();
 
-    ctx.fillStyle = '#0b0d12';
-    ctx.font = `700 ${Math.max(13, width * 0.018)}px Inter, sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(String(index + 1), x, y + 1);
-  });
+    refinement.refinedCorners.forEach((point, index) => {
+      const x = point.x * width;
+      const y = point.y * height;
+      ctx.beginPath();
+      ctx.arc(x, y, radius * 1.15, 0, Math.PI * 2);
+      ctx.fillStyle = '#34d399';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#064e3b';
+      ctx.stroke();
+
+      ctx.fillStyle = '#064e3b';
+      ctx.font = `800 ${Math.max(12, width * 0.016)}px Inter, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(index + 1), x, y + 1);
+    });
+  } else {
+    ctx.strokeStyle = 'rgba(240,217,168,0.95)';
+    ctx.fillStyle = 'rgba(240,217,168,0.12)';
+
+    if (corners.length > 1 && corners.length < 4) {
+      ctx.beginPath();
+      corners.forEach((point, index) => {
+        const x = point.x * width;
+        const y = point.y * height;
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    corners.forEach((point, index) => {
+      const x = point.x * width;
+      const y = point.y * height;
+      const isDragged = index === draggingIndex;
+
+      ctx.beginPath();
+      ctx.arc(x, y, isDragged ? radius * 1.3 : radius, 0, Math.PI * 2);
+      ctx.fillStyle = isDragged ? '#f6e6c4' : '#e6c079';
+      ctx.fill();
+      ctx.lineWidth = Math.max(2, width * 0.0025);
+      ctx.strokeStyle = 'rgba(8,9,12,0.85)';
+      ctx.stroke();
+
+      ctx.fillStyle = '#0b0d12';
+      ctx.font = `700 ${Math.max(13, width * 0.018)}px Inter, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(index + 1), x, y + 1);
+    });
+  }
 
   // Magnifier Loupe when dragging a corner
   if (draggingIndex >= 0 && corners[draggingIndex] && offscreenCanvas) {
@@ -117,13 +188,18 @@ function drawOverlay(ctx, width, height, corners, draggingIndex = -1, offscreenC
 export default function CalibrationView() {
   const calibrating = useChessLens((state) => state.ui.calibrating);
   const lang = useChessLens((state) => state.settings.lang);
+  const cameraFit = useChessLens((state) => state.cameraFit);
+  const baselineSharpness = useChessLens((state) => state.calibration?.baselineSharpness);
   const setSettings = useChessLens((state) => state.setSettings);
-  const { videoRef, finishCalibration, closeCalibration } = useShow();
+  const { videoRef, finishCalibration, closeCalibration, captureBaseline, runCameraFitCheck } = useShow();
   const t = (key) => translate(lang, key);
 
   const [corners, setCorners] = useState([]);
   const [orientation, setOrientation] = useState('white');
   const [hasFrame, setHasFrame] = useState(false);
+  const [refinement, setRefinement] = useState(null);
+  const [isRefining, setIsRefining] = useState(false);
+  const [previewRefined, setPreviewRefined] = useState(true);
   const draggingIndexRef = useRef(-1);
   const [draggingIndex, setDraggingIndex] = useState(-1);
   const previewRef = useRef(null);
@@ -133,15 +209,22 @@ export default function CalibrationView() {
   useEffect(() => {
     if (!calibrating) return;
     const state = useChessLens.getState();
-    setCorners(
-      state.calibration?.corners
-        ? state.calibration.corners.map((point) => ({ x: point.x, y: point.y }))
-        : [],
-    );
+    const initialCorners = state.calibration?.corners
+      ? state.calibration.corners.map((point) => ({ x: point.x, y: point.y }))
+      : [];
+    setCorners(initialCorners);
+    setRefinement(null);
     setOrientation(state.settings.flip ? 'black' : 'white');
     setHasFrame(false);
     hasFrameRef.current = false;
-  }, [calibrating]);
+    runCameraFitCheck(initialCorners);
+  }, [calibrating, runCameraFitCheck]);
+
+  useEffect(() => {
+    if (calibrating && corners.length === 4) {
+      runCameraFitCheck(corners);
+    }
+  }, [calibrating, corners, runCameraFitCheck]);
 
   useEffect(() => {
     if (!calibrating) return undefined;
@@ -172,7 +255,17 @@ export default function CalibrationView() {
 
         offscreenCtx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
         ctx.drawImage(offscreen, 0, 0, preview.width, preview.height);
-        drawOverlay(ctx, preview.width, preview.height, corners, draggingIndexRef.current, offscreen);
+        drawCameraFitOverlay(ctx, preview.width, preview.height, cameraFit, corners, orientation === 'black');
+        drawOverlay(
+          ctx,
+          preview.width,
+          preview.height,
+          corners,
+          draggingIndexRef.current,
+          offscreen,
+          refinement,
+          previewRefined,
+        );
 
         if (!hasFrameRef.current) {
           hasFrameRef.current = true;
@@ -183,8 +276,13 @@ export default function CalibrationView() {
           lastWarpAt = now;
           const warpCanvas = warpRef.current;
           if (warpCanvas) {
+            const activeWarpCorners =
+              refinement && previewRefined && refinement.refinedCorners
+                ? refinement.refinedCorners
+                : corners;
+
             const map = buildWarpMap({
-              corners,
+              corners: activeWarpCorners,
               destSize: WARP_SIZE,
               sourceWidth: offscreen.width,
               sourceHeight: offscreen.height,
@@ -204,7 +302,9 @@ export default function CalibrationView() {
               warpCtx.putImageData(image, 0, 0);
 
               // Overlaid 8x8 alignment grid on warped preview
-              warpCtx.strokeStyle = 'rgba(230, 192, 121, 0.45)';
+              warpCtx.strokeStyle = refinement && previewRefined
+                ? 'rgba(52, 211, 153, 0.65)'
+                : 'rgba(230, 192, 121, 0.45)';
               warpCtx.lineWidth = 1;
               for (let i = 1; i < 8; i += 1) {
                 const pos = (i * WARP_SIZE) / 8;
@@ -216,6 +316,29 @@ export default function CalibrationView() {
                 warpCtx.moveTo(0, pos);
                 warpCtx.lineTo(WARP_SIZE, pos);
                 warpCtx.stroke();
+              }
+
+              // Highlight glare squares if any
+              if (cameraFit?.img?.glareSquares?.length) {
+                const squareSize = WARP_SIZE / 8;
+                warpCtx.fillStyle = 'rgba(239, 68, 68, 0.35)';
+                warpCtx.strokeStyle = 'rgba(239, 68, 68, 0.9)';
+                warpCtx.lineWidth = 1.5;
+                for (const sq of cameraFit.img.glareSquares) {
+                  const cell = squareToCell(sq, orientation === 'black');
+                  const row = Math.floor(cell / 8);
+                  const col = cell % 8;
+                  const gx = col * squareSize;
+                  const gy = row * squareSize;
+                  warpCtx.fillRect(gx, gy, squareSize, squareSize);
+                  warpCtx.strokeRect(gx + 1, gy + 1, squareSize - 2, squareSize - 2);
+
+                  warpCtx.fillStyle = '#fee2e2';
+                  warpCtx.font = 'bold 9px Inter, sans-serif';
+                  warpCtx.textAlign = 'center';
+                  warpCtx.textBaseline = 'middle';
+                  warpCtx.fillText('⚡' + sq, gx + squareSize / 2, gy + squareSize / 2);
+                }
               }
             }
           }
@@ -234,7 +357,7 @@ export default function CalibrationView() {
 
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [calibrating, corners, videoRef]);
+  }, [calibrating, corners, refinement, previewRefined, videoRef, cameraFit, orientation, runCameraFitCheck]);
 
   function getCanvasPoint(event) {
     const canvas = previewRef.current;
@@ -268,6 +391,7 @@ export default function CalibrationView() {
     });
 
     if (nearestIdx >= 0) {
+      setRefinement(null);
       draggingIndexRef.current = nearestIdx;
       setDraggingIndex(nearestIdx);
       try {
@@ -276,6 +400,7 @@ export default function CalibrationView() {
         /* ignore */
       }
     } else if (corners.length < 4) {
+      setRefinement(null);
       const newCorners = [...corners, { x: pt.x, y: pt.y }];
       setCorners(newCorners);
     }
@@ -285,6 +410,7 @@ export default function CalibrationView() {
     if (draggingIndexRef.current < 0) return;
     const pt = getCanvasPoint(event);
     if (!pt) return;
+    setRefinement(null);
     setCorners((prev) => {
       const next = [...prev];
       next[draggingIndexRef.current] = { x: pt.x, y: pt.y };
@@ -308,6 +434,39 @@ export default function CalibrationView() {
     clearCalibration();
     useChessLens.getState().clearCalibrationState();
     setCorners([]);
+    setRefinement(null);
+  }
+
+  function handleRefineCorners() {
+    if (corners.length !== 4) return;
+    const video = videoRef.current;
+    if (!video || !video.videoWidth) return;
+    setIsRefining(true);
+    setTimeout(() => {
+      try {
+        const res = refineCorners({
+          corners,
+          source: video,
+          sourceWidth: video.videoWidth,
+          sourceHeight: video.videoHeight,
+        });
+        setRefinement(res);
+        setPreviewRefined(true);
+      } finally {
+        setIsRefining(false);
+      }
+    }, 25);
+  }
+
+  function handleAcceptRefinement() {
+    if (refinement?.refinedCorners) {
+      setCorners(refinement.refinedCorners);
+      setRefinement(null);
+    }
+  }
+
+  function handleKeepOriginal() {
+    setRefinement(null);
   }
 
   function handleConfirm() {
@@ -399,7 +558,23 @@ export default function CalibrationView() {
 
                 <div className="flex min-w-0 flex-col gap-4">
                   <div className="panel bg-white/[0.025] p-3">
-                    <div className="eyebrow mb-2">{t('warpPreview')}</div>
+                    <div className="mb-2 flex items-center justify-between">
+                      <div className="eyebrow">{t('warpPreview')}</div>
+                      {refinement && (
+                        <button
+                          type="button"
+                          onClick={() => setPreviewRefined(!previewRefined)}
+                          className={cx(
+                            'rounded border px-2 py-0.5 text-[10px] font-medium transition',
+                            previewRefined
+                              ? 'border-emerald-400/40 bg-emerald-500/20 text-emerald-200'
+                              : 'border-white/20 bg-white/5 text-white/60',
+                          )}
+                        >
+                          {previewRefined ? 'Preview: Refined' : 'Preview: Original'}
+                        </button>
+                      )}
+                    </div>
                     <canvas
                       ref={warpRef}
                       width={WARP_SIZE}
@@ -410,6 +585,65 @@ export default function CalibrationView() {
                       <p className="mt-2 text-center text-[11px] text-white/30">{t('clickCorners')}</p>
                     )}
                   </div>
+
+                  {refinement ? (
+                    <div className="rounded-xl border border-emerald-500/35 bg-emerald-950/40 p-3 text-xs text-white shadow-lg">
+                      <div className="flex items-center justify-between font-semibold text-emerald-300">
+                        <div className="flex items-center gap-1.5">
+                          <span>✨</span>
+                          <span>{t('refineScore')}:</span>
+                          <span className="font-mono text-white/70">{refinement.initialScore}</span>
+                          <span>→</span>
+                          <span className="font-mono text-emerald-200">{refinement.refinedScore}</span>
+                          <span className="font-mono text-[11px] text-emerald-400">
+                            ({refinement.improvementPct >= 0 ? '+' : ''}{refinement.improvementPct}%)
+                          </span>
+                        </div>
+                        <span className="font-mono text-[10px] text-white/50">
+                          shift: {refinement.maxShiftPx}px
+                        </span>
+                      </div>
+                      <div className="mt-1 text-[11px] text-white/70">
+                        {refinement.improved
+                          ? 'Grid lines aligned with higher edge contrast.'
+                          : 'Corners are already well-aligned.'}
+                      </div>
+                      <div className="mt-3 flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={handleAcceptRefinement}
+                          className="btn flex-1 border-emerald-400/50 bg-emerald-500/25 py-1.5 text-xs font-semibold text-emerald-100 hover:bg-emerald-500/35"
+                        >
+                          {t('acceptRefinement')}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleKeepOriginal}
+                          className="btn py-1.5 text-xs text-white/60 hover:text-white"
+                        >
+                          {t('keepOriginal')}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    corners.length === 4 && (
+                      <button
+                        type="button"
+                        onClick={handleRefineCorners}
+                        disabled={isRefining}
+                        className="btn border-brass-400/40 bg-brass-400/10 py-2 text-xs font-semibold text-brass-200 hover:border-brass-400/60 hover:bg-brass-400/20"
+                      >
+                        {isRefining ? t('refining') : `✨ ${t('refineCorners')}`}
+                      </button>
+                    )
+                  )}
+
+                  <CameraFitPanel
+                    fitResult={cameraFit}
+                    onCaptureBaseline={() => captureBaseline('start')}
+                    baselineActive={Boolean(baselineSharpness)}
+                    className="w-full"
+                  />
 
                   <div className="panel bg-white/[0.025] p-3">
                     <div className="eyebrow mb-2">{t('orientation')}</div>

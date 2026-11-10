@@ -13,6 +13,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "show": "npm run build && npm run preview",
+    "vision": "node scripts/start-vision.mjs",
     "postinstall": "npm run engine:copy",
     "test:logic": "node scripts/test-logic.mjs"
   },

@@ -4,3 +4,10 @@ backups/
 vision-service/.venv/
 vision-service/wheels/
 vision-service/logs/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+*.webm
+*.log
+.env

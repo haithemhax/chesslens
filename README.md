@@ -94,6 +94,39 @@ Calibration takes less than 60 seconds and is persisted safely in browser storag
 
 ---
 
+## Camera Fit Check & Framing Guide
+
+ChessLens includes an automated, real-time **Camera Fit Check** that continuously evaluates physical framing, board resolution, perspective tilt, lens sharpness, and lighting conditions.
+
+It operates entirely in JavaScript, runs sub-5ms downscaled evaluations throttled to once every 2 seconds while idle, and is **strictly operator-only**—no warnings or diagnostic markers are ever projected onto the audience display.
+
+### What is Measured
+| Metric | Good | Warning | Poor / Action Required | Actionable Operator Advice |
+| :--- | :--- | :--- | :--- | :--- |
+| **Board Inside Frame** | All 4 corners $\ge 3\%$ inside frame | Within 3% of edge | Any corner outside frame | *"Board is cut off on the right: move the phone left"* |
+| **Pixels Per Square** | $\ge 60\text{ px/sq}$ | $35 - 60\text{ px/sq}$ | $< 35\text{ px/sq}$ (fills $< 50\%$ height) | *"Board is too small: move the phone closer or zoom in"* |
+| **Perspective Tilt** | Angle deviation $\le 15^\circ$ | $15^\circ - 25^\circ$ deviation | $> 25^\circ$ deviation | *"Phone is tilted: place it directly above the board"* |
+| **Centering Offset** | Centroid within 8% of center | Off-center | Severely off-center | Panning direction hints: *"move the phone left/right/up/down"* |
+| **Grid Alignment** | Score $\ge 55 / 100$ | $35 - 55 / 100$ | $< 35 / 100$ | *"Grid alignment is low: check corner placement"* |
+| **Sharpness** | Variance $\ge 60$ | Baseline drop $\ge 40\%$ | Baseline drop $\ge 60\%$ | *"Image is blurry: clean the lens or lock the focus"* |
+| **Exposure** | Luminance $60 - 200$ | Luminance $< 60$ or $> 200$ | Severe over/under-exposure | *"Lighting is too dark/bright"* |
+| **Specular Glare** | Saturation $< 3\%$ | Saturation $\ge 3\%$ | Saturated square $\ge 6\%$ | *"Glare on e4, f4: move the lamp or change the angle"* |
+| **Camera Drift** | Position stable | — | Board bumped or shifted | *"Camera moved: recalibrate"* |
+
+### Visual Overlays (Operator & Calibration Views Only)
+- **Framing Guide**: A golden dashed rectangle with corner bracket accents indicates recommended framing.
+- **Pre-Calibration State**: Shows the dashed guide with *"Fit the whole board inside the frame"* while measuring exposure and sharpness on raw frames.
+- **Traffic-Light Status Quadrilateral**: The calibrated board boundary highlights in **Emerald** (Good), **Amber** (Warning), or **Red** (Poor).
+- **Localized Glare Highlighting**: Individual glare squares (e.g. `e4`, `f4`) are projected directly back to the physical camera frame and highlighted with translucent red fills and a `⚡` badge.
+- **Warp Preview Badges**: In the Calibration View, glare squares are also marked on the top-down 8×8 grid.
+
+### Operator Safeguards
+- **Pre-Show Checklist**: The Splash screen includes an informational Camera Fit check before show start.
+- **Live Show Toast**: If physical conditions drop from Good to Poor during a live match, an operator-only warning toast alerts the crew immediately.
+- **Baseline Capture Confirmation**: If the operator attempts to capture the baseline appearance while fit status is Poor, ChessLens prompts for confirmation first to avoid baking in bad calibration data.
+
+---
+
 ## Live Camera Video Panel (Side-by-Side View)
 
 In addition to the optional full-screen background, ChessLens features a dedicated **Live Camera Video Panel** placed directly to the **right** of the digital board:

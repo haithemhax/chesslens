@@ -1,9 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useShow } from '../state/ShowProvider.jsx';
 import { useChessLens } from '../state/store.js';
 import { LANGUAGES, translate } from '../i18n/translations.js';
 import { cx, Pill, RangeRow, Section, Switch } from './Ui.jsx';
+import { drawCameraFitOverlay } from '../lib/cameraFit.js';
+import CameraFitPanel from './CameraFitPanel.jsx';
 import DebugView from './DebugView.jsx';
 
 const MODE_KEYS = {
@@ -21,6 +23,7 @@ export default function OperatorPanel() {
   const open = useChessLens((state) => state.ui.operatorOpen);
   const settings = useChessLens((state) => state.settings);
   const camera = useChessLens((state) => state.camera);
+  const cameraFit = useChessLens((state) => state.cameraFit);
   const engine = useChessLens((state) => state.engine);
   const calibration = useChessLens((state) => state.calibration);
   const vision = useChessLens((state) => state.vision);
@@ -57,10 +60,52 @@ export default function OperatorPanel() {
     startRecording,
     stopRecording,
     selectRecordingDirectory,
+    captureBaseline,
+    videoRef,
   } = useShow();
 
   const [manual, setManual] = useState('');
   const [debugOpen, setDebugOpen] = useState(false);
+  const operatorCanvasRef = useRef(null);
+
+  useEffect(() => {
+    if (!open || camera.status !== 'live') return undefined;
+
+    let animId = 0;
+    let lastDraw = 0;
+    const interval = 1000 / 15; // 15 fps
+
+    function render(time) {
+      animId = requestAnimationFrame(render);
+      if (time - lastDraw < interval) return;
+      lastDraw = time;
+
+      const video = videoRef?.current;
+      const canvas = operatorCanvasRef.current;
+      if (!video || !canvas || video.readyState < 2 || !video.videoWidth) return;
+
+      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      drawCameraFitOverlay(
+        ctx,
+        canvas.width,
+        canvas.height,
+        cameraFit,
+        calibration?.corners,
+        settings.flip,
+      );
+    }
+
+    animId = requestAnimationFrame(render);
+    return () => cancelAnimationFrame(animId);
+  }, [open, camera.status, cameraFit, calibration?.corners, settings.flip, videoRef]);
 
   const lang = settings.lang;
   const t = (key, vars) => translate(lang, key, vars);
@@ -158,6 +203,20 @@ export default function OperatorPanel() {
                   <Pill tone={online ? 'good' : 'neutral'} dot>
                     {online ? t('online') : t('offline')}
                   </Pill>
+                  {cameraFit && (
+                    <Pill
+                      tone={
+                        cameraFit.status === 'good'
+                          ? 'good'
+                          : cameraFit.status === 'warning'
+                            ? 'warn'
+                            : 'bad'
+                      }
+                      dot
+                    >
+                      {`FIT: ${cameraFit.status.toUpperCase()}`}
+                    </Pill>
+                  )}
                   {demo.active && <Pill tone="brass">{t('demoBadge')}</Pill>}
                 </div>
 
@@ -213,6 +272,22 @@ export default function OperatorPanel() {
                   >
                     {calibration ? t('recalibrate') : t('calibrate')}
                   </button>
+
+                  {camera.status === 'live' && (
+                    <div className="relative mt-3 overflow-hidden rounded-xl border border-white/10 bg-black/60 shadow-inner">
+                      <canvas
+                        ref={operatorCanvasRef}
+                        className="mx-auto block aspect-video max-h-[175px] w-full object-contain"
+                      />
+                    </div>
+                  )}
+
+                  <CameraFitPanel
+                    fitResult={cameraFit}
+                    onCaptureBaseline={() => captureBaseline('start')}
+                    baselineActive={Boolean(calibration?.baselineSharpness)}
+                    className="mt-3"
+                  />
                 </Section>
 
                 <Section title={t('cameraPanel')}>

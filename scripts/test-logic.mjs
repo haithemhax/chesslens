@@ -29,6 +29,23 @@ import { OPERA_GAME } from '../src/demo/operaGame.js';
 import { translate } from '../src/i18n/translations.js';
 import { formatFilename, sanitizeFilenamePart } from '../src/recording/RecordingController.js';
 import { sanitizeSettings, persistableSettings } from '../src/state/store.js';
+import { VisionRouter, VISION_MODES } from '../src/vision/VisionRouter.js';
+import { VisionBackend } from '../src/vision/VisionBackend.js';
+import { JsVisionBackend } from '../src/vision/JsVisionBackend.js';
+import { PythonVisionBackend } from '../src/vision/PythonVisionBackend.js';
+import {
+  CAMERA_FIT_CONFIG,
+  computeQuadrilateralMetrics,
+  computeWarpedImageMetrics,
+  evaluateCameraFit,
+} from '../src/lib/cameraFit.js';
+import { warpBoard512, WARP_SIZE_V2 } from '../src/vision/v2/warp.js';
+import {
+  computeGridAlignmentScoreFromWarp,
+  computeDirectGridScore,
+  refineCorners,
+} from '../src/vision/v2/cornerRefinement.js';
+import { V2VisionBackend } from '../src/vision/v2/V2VisionBackend.js';
 
 let passed = 0;
 function test(name, fn) {
@@ -717,6 +734,550 @@ test('interactive chess play logic and legal move generation', () => {
   const promoMoves = promoGame.moves({ square: 'e7', verbose: true });
   assert.equal(promoMoves.length, 4); // q, r, b, n
   assert.ok(promoMoves.some((m) => m.promotion === 'q'));
+});
+
+test('shared coordinate test vectors match Python definitions exactly', () => {
+  // Canonical vector matching coordinates.py SHARED_TEST_VECTORS
+  const sharedVectors = [
+    { sq: 'a8', flip: false, cell: 0, r: 0, c: 0 },
+    { sq: 'h8', flip: false, cell: 7, r: 0, c: 7 },
+    { sq: 'a1', flip: false, cell: 56, r: 7, c: 0 },
+    { sq: 'h1', flip: false, cell: 63, r: 7, c: 7 },
+    { sq: 'e4', flip: false, cell: 36, r: 4, c: 4 },
+    { sq: 'a8', flip: true, cell: 63, r: 7, c: 7 },
+    { sq: 'h8', flip: true, cell: 56, r: 7, c: 0 },
+    { sq: 'a1', flip: true, cell: 7, r: 0, c: 7 },
+    { sq: 'h1', flip: true, cell: 0, r: 0, c: 0 },
+    { sq: 'e4', flip: true, cell: 27, r: 3, c: 3 },
+  ];
+
+  for (const item of sharedVectors) {
+    const cell = squareToCell(item.sq, item.flip);
+    assert.equal(cell, item.cell, `squareToCell(${item.sq}, flip=${item.flip})`);
+    const r = Math.floor(cell / 8);
+    const c = cell % 8;
+    assert.equal(r, item.r, `row of ${item.sq}`);
+    assert.equal(c, item.c, `col of ${item.sq}`);
+
+    const roundtrip = cellToSquare(cell, item.flip);
+    assert.equal(roundtrip, item.sq, `cellToSquare(${cell}, flip=${item.flip})`);
+  }
+});
+
+test('vision router state machine, health monitoring and fallback rules', () => {
+  let fallbackEvents = [];
+
+  class MockJsBackend extends VisionBackend {
+    constructor() {
+      super('js', 'Mock JS Vision');
+      this.callbacks = {};
+    }
+    setCallbacks(cb) { this.callbacks = { ...this.callbacks, ...cb }; }
+    start() {}
+    stop() {}
+    syncReference() { return true; }
+    setPosition() {}
+  }
+
+  class MockPythonBackend extends VisionBackend {
+    constructor() {
+      super('python', 'Mock Python Vision');
+      this.callbacks = {};
+      this._healthy = true;
+      this._connected = true;
+      this._p95Latency = 50;
+      this._lastMsgDelta = 100;
+    }
+    setCallbacks(cb) { this.callbacks = { ...this.callbacks, ...cb }; }
+    setOnConnectionChange(cb) { this.onConnectionChange = cb; }
+    isHealthy() {
+      return Boolean(this._healthy && this._connected && this._p95Latency <= 800 && this._lastMsgDelta <= 1500);
+    }
+    start() {}
+    stop() {}
+    syncReference() { return true; }
+    setPosition() {}
+  }
+
+  const js = new MockJsBackend();
+  const py = new MockPythonBackend();
+
+  const router = new VisionRouter({
+    jsBackend: js,
+    pythonBackend: py,
+    mode: VISION_MODES.JS_ONLY,
+    onFallback: (ev) => fallbackEvents.push(ev),
+  });
+
+  // 1. Initial default state: JS ONLY
+  assert.equal(router.mode, 'js');
+  assert.equal(router.authoritativeBackend.id, 'js');
+
+  // 2. Switch to AUTO when Python is healthy
+  router.lastSwitchAt = performance.now() - 70000; // allow switch
+  router.healthyStreak = 25; // sustained healthy streak
+  router.setMode(VISION_MODES.AUTO);
+  assert.equal(router.mode, 'auto');
+  assert.equal(router.authoritativeBackend.id, 'python');
+  assert.ok(fallbackEvents.some((ev) => ev.from === 'js' && ev.to === 'python'));
+
+  // 3. Python disconnects / becomes unhealthy mid-move -> automatic fallback to JS
+  fallbackEvents = [];
+  py._healthy = false;
+  router.evaluateHealth();
+  assert.equal(router.authoritativeBackend.id, 'js');
+  assert.ok(fallbackEvents.some((ev) => ev.from === 'python' && ev.to === 'js'));
+
+  // 4. Slow replies / latency spike (>800ms) prevents return to Python
+  fallbackEvents = [];
+  py._healthy = true;
+  py._p95Latency = 950; // exceeds 800ms
+  assert.equal(py.isHealthy(), false);
+  router.healthyStreak = 25;
+  router.lastSwitchAt = performance.now() - 70000;
+  // Evaluate health
+  py.callbacks.onState?.({ state: 'tracking' });
+  assert.equal(router.authoritativeBackend.id, 'js'); // stays on JS!
+
+  // 5. Stalled connection (>1500ms since last message)
+  py._p95Latency = 40;
+  py._lastMsgDelta = 1800; // stalled
+  assert.equal(py.isHealthy(), false);
+  py.callbacks.onState?.({ state: 'tracking' });
+  assert.equal(router.authoritativeBackend.id, 'js'); // stays on JS!
+});
+
+test('shadow mode compares JS authority with Python and logs mismatches', () => {
+  let shadowEvents = [];
+
+  class SimpleJsBackend extends VisionBackend {
+    constructor() { super('js', 'JS'); this.callbacks = {}; }
+    setCallbacks(cb) { this.callbacks = { ...this.callbacks, ...cb }; }
+    start() {}
+    stop() {}
+    syncReference() { return true; }
+    setPosition() {}
+  }
+  class SimplePyBackend extends VisionBackend {
+    constructor() { super('python', 'Python'); this.callbacks = {}; }
+    setCallbacks(cb) { this.callbacks = { ...this.callbacks, ...cb }; }
+    setOnConnectionChange() {}
+    isHealthy() { return true; }
+    start() {}
+    stop() {}
+    syncReference() { return true; }
+    setPosition() {}
+  }
+
+  const js = new SimpleJsBackend();
+  const py = new SimplePyBackend();
+
+  const router = new VisionRouter({
+    jsBackend: js,
+    pythonBackend: py,
+    mode: VISION_MODES.SHADOW,
+    onShadowMismatch: (entry, count) => shadowEvents.push({ entry, count }),
+  });
+
+  assert.equal(router.authoritativeBackend.id, 'js');
+
+  // JS emits e2e4
+  js.callbacks.onDetection({ best: { uci: 'e2e4' }, changedCells: [52, 36] });
+
+  // Python agrees on e2e4 -> no mismatch
+  py.callbacks.onDetection({ best: { uci: 'e2e4' }, changedCells: [52, 36] });
+  assert.equal(router.shadowMismatchCount, 0);
+
+  // Next move: JS emits e7e5, Python emits d7d5 -> mismatch!
+  js.callbacks.onDetection({ best: { uci: 'e7e5' }, changedCells: [12, 28] });
+  py.callbacks.onDetection({ best: { uci: 'd7d5' }, changedCells: [11, 27] });
+
+  assert.equal(router.shadowMismatchCount, 1);
+  assert.equal(shadowEvents.length, 1);
+  assert.equal(shadowEvents[0].entry.jsUci, 'e7e5');
+  assert.equal(shadowEvents[0].entry.pyUci, 'd7d5');
+});
+
+test('chess.js validates vision candidates and discards illegal moves', () => {
+  const game = new Chess();
+  const fenBefore = game.fen();
+
+  // Try applying illegal move candidate (e.g. e2e5 on initial position)
+  let moveResult = null;
+  try {
+    moveResult = game.move({ from: 'e2', to: 'e5' });
+  } catch {
+    moveResult = null;
+  }
+  assert.equal(moveResult, null);
+  // Board state was not corrupted
+  assert.equal(game.fen(), fenBefore);
+
+  // Legal move candidate applies cleanly
+  const legalMove = game.move({ from: 'e2', to: 'e4' });
+  assert.ok(legalMove);
+  assert.equal(legalMove.san, 'e4');
+  assert.notEqual(game.fen(), fenBefore);
+});
+
+// ------------------------------------------------------------- Camera Fit Check tests
+function createMockImageData(width, height, pixelFn) {
+  const data = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const idx = (y * width + x) * 4;
+      const [r, g, b, a = 255] = pixelFn(x, y);
+      data[idx] = r;
+      data[idx + 1] = g;
+      data[idx + 2] = b;
+      data[idx + 3] = a;
+    }
+  }
+  return { width, height, data };
+}
+
+test('camera fit: well-centered quadrilateral yields good status and high score', () => {
+  // Board covering ~70% of 1280x720 video with generous margins
+  const corners = [
+    { x: 0.15, y: 0.15 },
+    { x: 0.85, y: 0.15 },
+    { x: 0.85, y: 0.85 },
+    { x: 0.15, y: 0.85 },
+  ];
+  const metrics = computeQuadrilateralMetrics(corners, 1280, 720);
+  assert.equal(metrics.isValid, true);
+  assert.equal(metrics.isOutside, false);
+  assert.equal(metrics.isCloseToEdge, false);
+  assert.ok(metrics.pixelsPerSquare >= CAMERA_FIT_CONFIG.pixelsPerSquareGood);
+  assert.ok(metrics.maxAngleDeviation < 1);
+  assert.equal(metrics.hints.length, 0);
+
+  const evalResult = evaluateCameraFit({
+    corners,
+    videoWidth: 1280,
+    videoHeight: 720,
+  });
+  assert.equal(evalResult.status, 'good');
+  assert.ok(evalResult.score >= 90);
+});
+
+test('camera fit: corner outside frame yields poor status with cut-off warning', () => {
+  // Corner 0 is outside on the left
+  const corners = [
+    { x: -0.05, y: 0.15 },
+    { x: 0.85, y: 0.15 },
+    { x: 0.85, y: 0.85 },
+    { x: 0.15, y: 0.85 },
+  ];
+  const metrics = computeQuadrilateralMetrics(corners, 1280, 720);
+  assert.equal(metrics.isOutside, true);
+  assert.ok(metrics.messages.some((m) => m.includes('cut off on the left')));
+
+  const evalResult = evaluateCameraFit({ corners });
+  assert.equal(evalResult.status, 'poor');
+  assert.ok(evalResult.score < 65);
+});
+
+test('camera fit: board too small yields poor status with zoom/closer warning', () => {
+  // Board only 15% width and height (area tiny)
+  const corners = [
+    { x: 0.42, y: 0.42 },
+    { x: 0.58, y: 0.42 },
+    { x: 0.58, y: 0.58 },
+    { x: 0.42, y: 0.58 },
+  ];
+  const metrics = computeQuadrilateralMetrics(corners, 1280, 720);
+  assert.ok(metrics.pixelsPerSquare < CAMERA_FIT_CONFIG.pixelsPerSquareWarn);
+  assert.ok(metrics.messages.some((m) => m.includes('too small')));
+
+  const evalResult = evaluateCameraFit({ corners, videoWidth: 1280, videoHeight: 720 });
+  assert.equal(evalResult.status, 'poor');
+});
+
+test('camera fit: strongly skewed trapezoid yields poor status with tilt warning', () => {
+  // Top edge shifted right and bottom edge shifted left -> acute/obtuse angles > 30 deg deviation
+  const corners = [
+    { x: 0.35, y: 0.15 },
+    { x: 0.90, y: 0.15 },
+    { x: 0.60, y: 0.85 },
+    { x: 0.10, y: 0.85 },
+  ];
+  const metrics = computeQuadrilateralMetrics(corners, 1280, 720);
+  assert.ok(metrics.maxAngleDeviation > CAMERA_FIT_CONFIG.angleDeviationPoorDeg);
+  assert.ok(metrics.messages.some((m) => m.includes('tilted')));
+
+  const evalResult = evaluateCameraFit({ corners, videoWidth: 1280, videoHeight: 720 });
+  assert.equal(evalResult.status, 'poor');
+});
+
+test('camera fit: off-center board produces direction hints', () => {
+  // Board shifted towards bottom-right
+  const corners = [
+    { x: 0.35, y: 0.35 },
+    { x: 0.95, y: 0.35 },
+    { x: 0.95, y: 0.95 },
+    { x: 0.35, y: 0.95 },
+  ];
+  const metrics = computeQuadrilateralMetrics(corners, 1280, 720);
+  assert.ok(metrics.centroid.x > 0.58);
+  assert.ok(metrics.centroid.y > 0.58);
+  // Hints suggest panning left and up
+  assert.ok(metrics.hints.includes('pan_left'));
+  assert.ok(metrics.hints.includes('pan_up'));
+  assert.ok(metrics.messages.some((m) => m.includes('move the phone left')));
+  assert.ok(metrics.messages.some((m) => m.includes('move the phone up')));
+});
+
+test('camera fit: aligned checkerboard warped image produces high grid score', () => {
+  const image = createMockImageData(256, 256, (x, y) => {
+    const col = Math.floor(x / 32);
+    const row = Math.floor(y / 32);
+    const isLight = (col + row) % 2 === 0;
+    const val = isLight ? 180 : 70;
+    return [val, val, val];
+  });
+
+  const metrics = computeWarpedImageMetrics(image);
+  assert.ok(metrics.gridScore >= CAMERA_FIT_CONFIG.gridScoreGood, `Grid score ${metrics.gridScore} should be >= ${CAMERA_FIT_CONFIG.gridScoreGood}`);
+  assert.ok(metrics.meanBrightness >= 100 && metrics.meanBrightness <= 150);
+  assert.equal(metrics.glareSquares.length, 0);
+});
+
+test('camera fit: shifted corners (15px) drops grid alignment score below threshold', () => {
+  // Checkerboard shifted by 16px horizontally and vertically relative to grid lines
+  const image = createMockImageData(256, 256, (x, y) => {
+    const col = Math.floor((x + 16) / 32);
+    const row = Math.floor((y + 16) / 32);
+    const isLight = (col + row) % 2 === 0;
+    const val = isLight ? 180 : 70;
+    return [val, val, val];
+  });
+
+  const metrics = computeWarpedImageMetrics(image);
+  assert.ok(metrics.gridScore < CAMERA_FIT_CONFIG.gridScoreWarn, `Grid score ${metrics.gridScore} should be < ${CAMERA_FIT_CONFIG.gridScoreWarn}`);
+  assert.ok(metrics.messages.some((m) => m.includes('Grid alignment is low')));
+});
+
+test('camera fit: blurred warped image detects sharpness drop and warns to clean lens', () => {
+  // Uniform flat image (sharpness variance 0)
+  const flatImage = createMockImageData(256, 256, () => [120, 120, 120]);
+  const metrics = computeWarpedImageMetrics(flatImage, 200); // baseline was 200
+
+  assert.ok(metrics.sharpnessDropPct >= 60);
+  assert.ok(metrics.messages.some((m) => m.includes('blurry')));
+});
+
+test('camera fit: glare patch on e4 is localized and reported with square label', () => {
+  // Square e4 in standard orientation (flip = false):
+  // file 'e' -> col 4 (0-indexed)
+  // rank '4' -> row 4 (0-indexed from top: rank 8=0 ... rank 4=4)
+  const image = createMockImageData(256, 256, (x, y) => {
+    const col = Math.floor(x / 32);
+    const row = Math.floor(y / 32);
+    if (col === 4 && row === 4) {
+      // Saturated glare spot
+      return [255, 255, 255];
+    }
+    return [110, 110, 110];
+  });
+
+  const metrics = computeWarpedImageMetrics(image, null, false);
+  assert.ok(metrics.glareSquares.includes('e4'), `Expected glare on e4, got ${metrics.glareSquares.join(', ')}`);
+  assert.ok(metrics.messages.some((m) => m.includes('Glare on e4')));
+});
+
+test('camera fit: evaluateCameraFit before calibration shows guide without grid error', () => {
+  // No corners yet (pre-calibration state)
+  const rawImage = createMockImageData(256, 256, () => [130, 130, 130]);
+  const result = evaluateCameraFit({
+    corners: null,
+    imageData: rawImage,
+  });
+
+  assert.equal(result.geom.isValid, false);
+  assert.ok(result.messages.includes('Fit the whole board inside the frame'));
+  // Should NOT complain about grid alignment before corners are marked
+  assert.ok(!result.messages.some((m) => m.includes('Grid alignment')));
+});
+
+// ------------------------------------------------------------- Vision v2 tests (Phase 1)
+test('vision v2: warpBoard512 extracts 512x512 top-down image with precomputed lookup table', () => {
+  assert.equal(WARP_SIZE_V2, 512);
+
+  // Synthetic 640x480 image
+  const W = 640;
+  const H = 480;
+  const source = createMockImageData(W, H, (x, y) => [
+    (x % 256),
+    (y % 256),
+    ((x + y) % 256),
+  ]);
+
+  const corners = [
+    { x: 0.1, y: 0.1 },
+    { x: 0.9, y: 0.1 },
+    { x: 0.9, y: 0.9 },
+    { x: 0.1, y: 0.9 },
+  ];
+
+  const warped = warpBoard512({
+    source,
+    corners,
+    sourceWidth: W,
+    sourceHeight: H,
+  });
+
+  assert.ok(warped);
+  assert.equal(warped.width, 512);
+  assert.equal(warped.height, 512);
+  assert.equal(warped.imageData.data.length, 512 * 512 * 4);
+  assert.ok(warped.warpMap);
+  assert.equal(warped.warpMap.offsets.length, 512 * 512);
+});
+
+test('vision v2: computeGridAlignmentScore measures edge energy on 9+9 grid lines vs square interiors', () => {
+  // Aligned 256x256 checkerboard
+  const alignedWarp = createMockImageData(256, 256, (x, y) => {
+    const col = Math.floor(x / 32);
+    const row = Math.floor(y / 32);
+    const isLight = (col + row) % 2 === 0;
+    const val = isLight ? 210 : 70;
+    return [val, val, val];
+  });
+
+  const alignedMetrics = computeGridAlignmentScoreFromWarp(alignedWarp);
+  assert.ok(alignedMetrics.score >= 80, `Expected aligned score >= 80, got ${alignedMetrics.score}`);
+  assert.ok(alignedMetrics.gridEnergy > alignedMetrics.interiorEnergy * 2);
+
+  // Shifted 256x256 checkerboard (shifted by 16px, so grid lines hit square centers)
+  const shiftedWarp = createMockImageData(256, 256, (x, y) => {
+    const col = Math.floor((x + 16) / 32);
+    const row = Math.floor((y + 16) / 32);
+    const isLight = (col + row) % 2 === 0;
+    const val = isLight ? 210 : 70;
+    return [val, val, val];
+  });
+
+  const shiftedMetrics = computeGridAlignmentScoreFromWarp(shiftedWarp);
+  assert.ok(shiftedMetrics.score < alignedMetrics.score - 30, `Shifted score ${shiftedMetrics.score} should drop significantly below ${alignedMetrics.score}`);
+});
+
+test('vision v2: refineCorners searches ~2% radius, improves score, and tightens corners back towards ground truth', () => {
+  const W = 800;
+  const H = 800;
+  const boardX0 = 100;
+  const boardY0 = 100;
+  const sqSize = 75; // 8 * 75 = 600 px board
+
+  const source = createMockImageData(W, H, (x, y) => {
+    let val = 40; // background border
+    if (x >= boardX0 && x < boardX0 + 8 * sqSize && y >= boardY0 && y < boardY0 + 8 * sqSize) {
+      const col = Math.floor((x - boardX0) / sqSize);
+      const row = Math.floor((y - boardY0) / sqSize);
+      const isLight = (col + row) % 2 === 0;
+      val = isLight ? 215 : 75;
+    }
+    return [val, val, val];
+  });
+
+  const trueCorners = [
+    { x: boardX0 / W, y: boardY0 / H },
+    { x: (boardX0 + 600) / W, y: boardY0 / H },
+    { x: (boardX0 + 600) / W, y: (boardY0 + 600) / H },
+    { x: boardX0 / W, y: (boardY0 + 600) / H },
+  ];
+
+  // Perturb corners by ~2% (15 pixels)
+  const perturbedCorners = [
+    { x: (boardX0 - 14) / W, y: (boardY0 + 12) / H },
+    { x: (boardX0 + 600 + 15) / W, y: (boardY0 - 10) / H },
+    { x: (boardX0 + 600 - 12) / W, y: (boardY0 + 600 + 15) / H },
+    { x: (boardX0 + 14) / W, y: (boardY0 + 600 - 12) / H },
+  ];
+
+  const result = refineCorners({
+    corners: perturbedCorners,
+    source,
+    sourceWidth: W,
+    sourceHeight: H,
+    maxSearchFrac: 0.025,
+  });
+
+  assert.ok(result);
+  assert.equal(result.refinedCorners.length, 4);
+  assert.ok(result.improved, 'Refinement should flag improved = true');
+  assert.ok(result.refinedScore > result.initialScore, `Refined score ${result.refinedScore} should exceed initial score ${result.initialScore}`);
+  assert.ok(result.elapsedMs < 60, `Refinement took ${result.elapsedMs}ms, should be < 60ms`);
+
+  // Measure Euclidean distance to ground truth before vs after
+  let totalErrorBefore = 0;
+  let totalErrorAfter = 0;
+  for (let i = 0; i < 4; i += 1) {
+    const errBefore = Math.hypot((perturbedCorners[i].x - trueCorners[i].x) * W, (perturbedCorners[i].y - trueCorners[i].y) * H);
+    const errAfter = Math.hypot((result.refinedCorners[i].x - trueCorners[i].x) * W, (result.refinedCorners[i].y - trueCorners[i].y) * H);
+    totalErrorBefore += errBefore;
+    totalErrorAfter += errAfter;
+  }
+
+  assert.ok(totalErrorAfter < totalErrorBefore * 0.6, `Error after (${totalErrorAfter.toFixed(1)}px) should be substantially lower than before (${totalErrorBefore.toFixed(1)}px)`);
+});
+
+test('vision v2: refineCorners gracefully handles invalid, degenerate, or edge-clamped corners', () => {
+  const dummySource = createMockImageData(256, 256, () => [128, 128, 128]);
+
+  // Degenerate corners (colinear)
+  const colinear = [
+    { x: 0.1, y: 0.1 },
+    { x: 0.2, y: 0.2 },
+    { x: 0.3, y: 0.3 },
+    { x: 0.4, y: 0.4 },
+  ];
+  const resColinear = refineCorners({ corners: colinear, source: dummySource });
+  assert.ok(resColinear);
+  assert.equal(resColinear.refinedCorners.length, 4);
+
+  // Missing corners
+  const resEmpty = refineCorners({ corners: [], source: dummySource });
+  assert.equal(resEmpty.improved, false);
+  assert.ok(resEmpty.error);
+
+  // Missing source
+  const resNoSource = refineCorners({
+    corners: [{ x: 0.1, y: 0.1 }, { x: 0.9, y: 0.1 }, { x: 0.9, y: 0.9 }, { x: 0.1, y: 0.9 }],
+    source: null,
+  });
+  assert.equal(resNoSource.improved, false);
+  assert.ok(resNoSource.error);
+});
+
+test('vision v2: V2VisionBackend conforms to VisionBackend interface and exposes refinement', () => {
+  const backend = new V2VisionBackend();
+  assert.equal(backend.id, 'v2');
+  assert.equal(backend.name, 'JavaScript Vision v2');
+
+  let stateEmitted = null;
+  backend.setCallbacks({
+    onState: (s) => { stateEmitted = s; },
+  });
+
+  backend.setCalibration([{ x: 0.1, y: 0.1 }, { x: 0.9, y: 0.1 }, { x: 0.9, y: 0.9 }, { x: 0.1, y: 0.9 }], false);
+  backend.setFlip(true);
+  assert.equal(backend.flip, true);
+
+  backend.start();
+  assert.equal(backend.running, true);
+  assert.equal(backend.paused, false);
+
+  backend.pause();
+  assert.equal(backend.paused, true);
+
+  backend.resume();
+  assert.equal(backend.paused, false);
+
+  const debug = backend.getDebugState();
+  assert.equal(debug.id, 'v2');
+  assert.equal(debug.running, true);
+  assert.equal(debug.paused, false);
 });
 
 console.log(`\n${passed} logic checks passed.`);

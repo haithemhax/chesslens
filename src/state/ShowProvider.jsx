@@ -19,6 +19,8 @@ import { saveCalibration, saveSettings } from '../lib/storage.js';
 import { translate, languageDir } from '../i18n/translations.js';
 import { parseMoveInput } from '../lib/chessHelpers.js';
 import { evalFromMaterial, gameResult, normalizeEngineScore } from '../lib/evaluation.js';
+import { buildWarpMap } from '../lib/homography.js';
+import { evaluateCameraFit } from '../lib/cameraFit.js';
 import { buildLlmContext } from '../commentary/commentary.js';
 import { requestLlmCommentary } from '../commentary/llm.js';
 import { DEMO_MOVE_INTERVAL_MS, OPERA_GAME } from '../demo/operaGame.js';
@@ -48,6 +50,9 @@ export function ShowProvider({ children }) {
   const handlersRef = useRef({});
   const actionsRef = useRef({});
   const lastVisionErrorRef = useRef(0);
+  const lastFitStatusRef = useRef('good');
+  const analysisWarpCanvasRef = useRef(null);
+  const analysisSourceCanvasRef = useRef(null);
 
   const settings = useChessLens((state) => state.settings);
   const cameraStatus = useChessLens((state) => state.camera.status);
@@ -396,7 +401,137 @@ export function ShowProvider({ children }) {
         latest.setDebug({ changedCells: [], candidates: [] });
         latest.notify(translate(latest.settings.lang, 'calibrationSaved'), saved ? 'success' : 'warning');
       }
+      runCameraFitCheck();
     }, 1400);
+  }
+
+  // ------------------------------------------------------------- camera fit
+  function runCameraFitCheck(customCorners = null) {
+    const state = useChessLens.getState();
+    const video = videoRef.current;
+    const corners = customCorners || state.calibration?.corners || null;
+    const driftDetected = Boolean(state.vision.driftDetected);
+    const flip = Boolean(state.settings.flip);
+    const baselineSharpness = state.calibration?.baselineSharpness || null;
+
+    let videoWidth = 1280;
+    let videoHeight = 720;
+    let imageData = null;
+
+    if (video && video.videoWidth && video.videoHeight) {
+      videoWidth = video.videoWidth;
+      videoHeight = video.videoHeight;
+
+      if (corners && corners.length === 4) {
+        try {
+          if (!analysisWarpCanvasRef.current) {
+            analysisWarpCanvasRef.current = document.createElement('canvas');
+            analysisWarpCanvasRef.current.width = 256;
+            analysisWarpCanvasRef.current.height = 256;
+          }
+          const warpCanvas = analysisWarpCanvasRef.current;
+          const warpCtx = warpCanvas.getContext('2d', { willReadFrequently: true });
+
+          const scale = Math.min(1, 512 / Math.max(videoWidth, videoHeight));
+          const sw = Math.max(2, Math.round(videoWidth * scale));
+          const sh = Math.max(2, Math.round(videoHeight * scale));
+
+          if (!analysisSourceCanvasRef.current) {
+            analysisSourceCanvasRef.current = document.createElement('canvas');
+          }
+          const srcCanvas = analysisSourceCanvasRef.current;
+          if (srcCanvas.width !== sw || srcCanvas.height !== sh) {
+            srcCanvas.width = sw;
+            srcCanvas.height = sh;
+          }
+          const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
+          srcCtx.drawImage(video, 0, 0, sw, sh);
+          const source = srcCtx.getImageData(0, 0, sw, sh).data;
+
+          const map = buildWarpMap({
+            corners,
+            destSize: 256,
+            sourceWidth: sw,
+            sourceHeight: sh,
+          });
+
+          if (map) {
+            const image = warpCtx.createImageData(256, 256);
+            const offsets = map.offsets;
+            const dest = image.data;
+            for (let i = 0, o = 0; i < offsets.length; i += 1, o += 4) {
+              const s = offsets[i];
+              dest[o] = source[s];
+              dest[o + 1] = source[s + 1];
+              dest[o + 2] = source[s + 2];
+              dest[o + 3] = 255;
+            }
+            warpCtx.putImageData(image, 0, 0);
+            imageData = image;
+          }
+        } catch {
+          /* ignore frame capture errors during resize */
+        }
+      } else {
+        // Measure what can be measured on raw frame (brightness, sharpness) before corners are calibrated
+        try {
+          if (!analysisSourceCanvasRef.current) {
+            analysisSourceCanvasRef.current = document.createElement('canvas');
+          }
+          const srcCanvas = analysisSourceCanvasRef.current;
+          if (srcCanvas.width !== 256 || srcCanvas.height !== 256) {
+            srcCanvas.width = 256;
+            srcCanvas.height = 256;
+          }
+          const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
+          srcCtx.drawImage(video, 0, 0, 256, 256);
+          imageData = srcCtx.getImageData(0, 0, 256, 256);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
+    const fitResult = evaluateCameraFit({
+      corners,
+      videoWidth,
+      videoHeight,
+      imageData,
+      baselineSharpness,
+      driftDetected,
+      flip,
+    });
+
+    const prevStatus = lastFitStatusRef.current;
+    lastFitStatusRef.current = fitResult.status;
+
+    // Operator toast when status drops to poor during live show
+    if (prevStatus === 'good' && fitResult.status === 'poor' && state.camera.status === 'live' && !state.demo.active) {
+      state.notify(translate(state.settings.lang, 'cameraFitPoorToast'), 'warning');
+    }
+
+    state.setCameraFit(fitResult);
+    return fitResult;
+  }
+
+  function captureBaselineAction(type = 'start') {
+    const state = useChessLens.getState();
+    if (state.cameraFit?.status === 'poor') {
+      const ok = typeof window !== 'undefined' ? window.confirm(translate(state.settings.lang, 'confirmPoorBaseline')) : true;
+      if (!ok) return null;
+    }
+    const res = visionRef.current?.captureBaseline(type);
+    const fit = runCameraFitCheck();
+    if (state.calibration && fit?.img?.sharpness) {
+      const updated = {
+        ...state.calibration,
+        baselineSharpness: fit.img.sharpness,
+      };
+      saveCalibration(updated);
+      state.setCalibration(updated);
+    }
+    notifyKey('baselineCaptured', 'success');
+    return res;
   }
 
   // --------------------------------------------------------------- detection
@@ -832,6 +967,8 @@ export function ShowProvider({ children }) {
     openCalibration,
     closeCalibration,
     finishCalibration,
+    runCameraFitCheck,
+    captureBaseline: captureBaselineAction,
     syncBoard,
     applyUci,
     applyMoveText,
@@ -913,6 +1050,16 @@ export function ShowProvider({ children }) {
     actionsRef.current.initEngine();
     return () => actionsRef.current.disposeEngine();
   }, []);
+
+  // Periodic Camera Fit check (every 2 seconds while camera is live and not actively calibrating)
+  useEffect(() => {
+    if (cameraStatus !== 'live' || calibrating) return undefined;
+    runCameraFitCheck();
+    const interval = setInterval(() => {
+      runCameraFitCheck();
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [cameraStatus, calibrating, calibration]);
 
   useEffect(() => {
     const vision = visionRef.current;
@@ -1312,7 +1459,8 @@ export function ShowProvider({ children }) {
     exitFullscreen: () => exitFullscreen(),
     toggleFullscreen: () => toggleFullscreen(),
     setTestMode: (enabled) => visionRef.current?.setTestMode(enabled),
-    captureBaseline: (type) => visionRef.current?.captureBaseline(type),
+    runCameraFitCheck: (...args) => runCameraFitCheck(...args),
+    captureBaseline: (type) => captureBaselineAction(type),
     startVisionRecording: () => visionRef.current?.startRecording(),
     stopVisionRecording: () => visionRef.current?.stopRecording(),
     getVisionRecordedFrames: () => visionRef.current?.getRecordedFrames() || [],

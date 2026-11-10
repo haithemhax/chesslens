@@ -123,11 +123,6 @@ export default function AudienceScreen() {
           <div className="chip border-white/10">
             {t('moveNumber')} <span className="font-mono text-white/75">{moveNumber}</span>
           </div>
-          {!calibration && !demo && (
-            <div className="chip border-amber-400/30 bg-amber-400/10 text-amber-200/90">
-              {t('calibrationNeeded')}
-            </div>
-          )}
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
